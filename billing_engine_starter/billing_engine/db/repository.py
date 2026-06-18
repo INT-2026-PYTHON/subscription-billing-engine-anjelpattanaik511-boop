@@ -572,26 +572,50 @@ class InvoiceLineItemRepository:
 # LEDGER — APPEND-ONLY (do not implement update/delete)
 # ============================================================
 class LedgerRepository:
-    """Persistence boundary for the append-only accounting ledger.
+    """Persistence boundary for the append-only accounting ledger."""
 
-    The ledger records financial movements: DEBIT when the customer owes money,
-    CREDIT when money is received or reversed. It is append-only so history is
-    auditable; mistakes should be corrected with reversing entries, not edits.
-    """
-
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db) -> None:
         self.db = db
 
     def add(self, entry: LedgerEntry) -> LedgerEntry:
-        # TODO Day 3.
-        # Hint: q.insert_ledger_entry(...)
-        raise NotImplementedError("Day 3: implement LedgerRepository.add")
+        with self.db.transaction() as conn:
+            entry_id = q.insert_ledger_entry(
+                conn,
+                entry.invoice_id,
+                entry.customer_id,
+                str(entry.amount.amount),   # <-- FIX: Convert Decimal to string for SQLite
+                str(entry.amount.currency), # <-- FIX: Convert to string just in case
+                entry.direction,
+                entry.reason,
+            )
+            
+        return LedgerEntry(
+            id=entry_id,
+            invoice_id=entry.invoice_id,
+            customer_id=entry.customer_id,
+            amount=entry.amount,            # <-- Pass the original Money object back
+            direction=entry.direction,
+            reason=entry.reason,
+        )
 
     def list_for_customer(self, customer_id: int) -> list[LedgerEntry]:
-        # TODO Day 3.
-        # Hint: q.select_ledger_for_customer(...)
-        raise NotImplementedError("Day 3: implement LedgerRepository.list_for_customer")
-
+        with self.db.connect() as conn:
+            rows = q.select_ledger_for_customer(conn, customer_id)
+            
+        return [
+            LedgerEntry(
+                id=row["id"],
+                invoice_id=row["invoice_id"],
+                customer_id=row["customer_id"],
+                amount=Money(str(row["amount"]), str(row["currency"])), 
+                direction=row["direction"],
+                reason=row["reason"],
+                # FIX: Slice the string to keep only the 'YYYY-MM-DD' portion
+                created_at=date.fromisoformat(str(row["created_at"])[:10]),
+            )
+            for row in rows
+        ]
+    
     # These two methods are intentionally implemented to REJECT — do not override.
     def update(self, *args, **kwargs):
         raise NotImplementedError("Ledger is append-only. Post a reversing entry instead.")
@@ -623,15 +647,34 @@ class PaymentAttemptRepository:
         next_retry_at: Optional[datetime],
     ) -> int:
         # TODO Day 3.
-        # Hint: q.insert_payment_attempt(...)
-        raise NotImplementedError("Day 3: implement PaymentAttemptRepository.add")
+        with self.db.transaction() as conn:
+            return q.insert_payment_attempt(
+                conn,
+                invoice_id,
+                attempt_no,
+                status,
+                failure_reason,
+                next_retry_at.isoformat() if next_retry_at else None,
+            )
 
     def list_for_invoice(self, invoice_id: int) -> list[dict]:
         # TODO Day 3.
-        # Hint: q.select_attempts_for_invoice(...)
-        raise NotImplementedError("Day 3: implement PaymentAttemptRepository.list_for_invoice")
+        with self.db.connect() as conn:
+            rows = q.select_attempts_for_invoice(conn, invoice_id)
+        return [
+            {
+                "id": row["id"],
+                "invoice_id": row["invoice_id"],
+                "attempt_no": row["attempt_no"],
+                "status": row["status"],
+                "failure_reason": row["failure_reason"],
+                "next_retry_at": row["next_retry_at"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def count_for_invoice(self, invoice_id: int) -> int:
         # TODO Day 3.
-        # Hint: q.count_attempts_for_invoice(...)
-        raise NotImplementedError("Day 3: implement PaymentAttemptRepository.count_for_invoice")
+         with self.db.connect() as conn:
+            return q.count_attempts_for_invoice(conn, invoice_id)

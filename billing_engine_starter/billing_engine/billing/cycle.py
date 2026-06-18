@@ -1,67 +1,100 @@
 """
-BillingCycle — finds due subscriptions, generates invoices, posts ledger DEBITs,
-advances the subscription period. Must be IDEMPOTENT (safe to run twice).
+build_invoice — PURE function that turns inputs into an Invoice dataclass.
+
+⚠️ NO database calls here. No `datetime.now()`. No PDF. Just math.
+
+The order is FIXED:
+    1. base       = strategy.calculate(usage)
+    2. discount   = discount.apply(base) if discount else 0
+    3. taxable    = base - discount
+    4. tax        = tax_calc.apply(taxable)
+    5. total      = taxable + tax.total
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date
-from typing import Callable, Optional
+from typing import Optional
 
-from billing_engine.db import (
-    Database,
-    CustomerRepository, PlanRepository, SubscriptionRepository,
-    UsageRecordRepository, InvoiceRepository, InvoiceLineItemRepository,
-    LedgerRepository,
+from billing_engine.money import Money
+from billing_engine.models import (
+    Invoice, InvoiceStatus, InvoiceLineItem, LineItemKind, Subscription, Plan,
 )
-from billing_engine.models import Subscription
+from billing_engine.pricing.base import PricingStrategy
+from billing_engine.discounts.base import Discount, DiscountContext
+from billing_engine.taxes.base import TaxCalculator, TaxContext
 
 
-@dataclass
-class BillingResult:
-    invoices_created: int
-    invoices_skipped_duplicate: int
-    trials_activated: int
+def build_invoice(
+    subscription: Subscription,
+    plan: Plan,
+    strategy: PricingStrategy,
+    discount: Optional[Discount],
+    tax_calc: TaxCalculator,
+    tax_context: TaxContext,
+    usage_quantity: int,
+    period_start: date,
+    period_end: date,
+    invoice_count_so_far: int,
+) -> Invoice:
+    """Pure function. Returns an Invoice (id=None, status=DRAFT) ready to be persisted."""
 
 
-class BillingCycle:
-    """Day-3 deliverable. Day-4 stretch: add `upgrade_subscription(...)`."""
+    base = strategy.calculate(usage_quantity)
+    
 
-    def __init__(
-        self,
-        db: Database,
-        customer_repo: CustomerRepository,
-        plan_repo: PlanRepository,
-        subscription_repo: SubscriptionRepository,
-        usage_repo: UsageRecordRepository,
-        invoice_repo: InvoiceRepository,
-        line_item_repo: InvoiceLineItemRepository,
-        ledger_repo: LedgerRepository,
-        strategy_factory: Callable,    # given a Plan, returns a PricingStrategy
-        discount_factory: Callable,    # given a discount_id or None, returns a Discount or None
-        tax_factory: Callable,         # given a Customer, returns (TaxCalculator, TaxContext)
-    ) -> None:
-        self.db = db
-        self.customer_repo = customer_repo
-        self.plan_repo = plan_repo
-        self.subscription_repo = subscription_repo
-        self.usage_repo = usage_repo
-        self.invoice_repo = invoice_repo
-        self.line_item_repo = line_item_repo
-        self.ledger_repo = ledger_repo
-        self.strategy_factory = strategy_factory
-        self.discount_factory = discount_factory
-        self.tax_factory = tax_factory
+    discount_context = DiscountContext(invoice_count_so_far=invoice_count_so_far)
+    discount_amount = Money.zero(base.currency)
+    if discount:
+        discount_amount = discount.apply(base, discount_context)
+    
 
-    # --------------------------------------------------------
-    def run(self, as_of: date) -> BillingResult:
-        """Bill all subscriptions whose current period ends on or before `as_of`."""
-        # TODO Day 3
-        raise NotImplementedError("Day 3: implement BillingCycle.run")
+    taxable = base - discount_amount
+    tax_breakdown = tax_calc.apply(taxable, tax_context)
+    total = taxable + tax_breakdown.total
+    
 
-    # --------------------------------------------------------
-    def upgrade_subscription(self, subscription_id: int, new_plan_id: int, switch_date: date) -> None:
-        """Mid-cycle upgrade — Day 4 stretch."""
-        # TODO Day 4
-        raise NotImplementedError("Day 4: implement BillingCycle.upgrade_subscription")
+    line_items = []
+    line_items.append(InvoiceLineItem(
+        id=None,
+        invoice_id=None,
+        description="Base charge",
+        amount=base,
+        kind=LineItemKind.BASE,
+    ))
+    
+
+    if discount_amount.is_positive():
+        line_items.append(InvoiceLineItem(
+            id=None,
+            invoice_id=None,
+            description="Discount",
+            amount=-discount_amount,
+            kind=LineItemKind.DISCOUNT,
+        ))
+    
+
+    for tax_label, tax_amount in tax_breakdown.components:
+        line_items.append(InvoiceLineItem(
+            id=None,
+            invoice_id=None,
+            description=tax_label,
+            amount=tax_amount,
+            kind=LineItemKind.TAX,
+        ))
+    
+
+    return Invoice(
+        id=None,
+        subscription_id=subscription.id,
+        period_start=period_start,
+        period_end=period_end,
+        subtotal=base,
+        discount_total=discount_amount,
+        tax_total=tax_breakdown.total,
+        total=total,
+        status=InvoiceStatus.DRAFT,
+        issued_at=None,
+        pdf_path=None,
+        line_items=line_items,
+    )
